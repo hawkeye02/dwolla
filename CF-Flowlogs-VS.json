@@ -1,0 +1,275 @@
+{
+  "AWSTemplateFormatVersion" : "2010-09-09",
+  
+  "Description" : "FlowLogs S3 Processor",
+
+  "Parameters" : {},
+
+  "Mappings" : {
+    "Defaults" : {
+      "LogGroup" : {
+        "RetentionInDays" : 1
+      },
+      "Stream" : {
+        "ShardCount" : 10
+      },
+      "EventSourceMapping" : {
+        "BatchSize" :  10000
+      }
+    }
+  },
+
+  "Resources" : {
+    "Bucket" : {
+      "DeletionPolicy" : "Retain",
+      "Type" : "AWS::S3::Bucket",
+      "Properties" : {
+        "BucketName" : "dwolla-technical-exercise",  
+        "LifecycleConfiguration" : {
+          "Rules" : [ 
+              {
+                "Status" : "Enabled",
+                "ExpirationInDays" : 7
+              }
+          ]
+        }
+      }
+    },
+
+    "FlowLogs" : {
+      "Type" : "AWS::Logs::LogGroup",
+      "Properties" : {
+        "RetentionInDays" : { "Fn::FindInMap" : [ "Defaults", "LogGroup",
+          "RetentionInDays" ] }
+      }
+    },
+
+    "LogStream" : {
+      "Type" : "AWS::Kinesis::Stream",
+      "Properties" :  {
+        "ShardCount" : { "Fn::FindInMap" : [ "Defaults", "Stream",
+          "ShardCount" ] }
+      }
+    },
+    
+    "FlowLogsToCloudWatch" : {
+      "Type" : "AWS::IAM::Role",
+      "Properties" : {
+        "AssumeRolePolicyDocument" : {
+          "Statement" : [ 
+            {
+              "Effect" : "Allow",
+              "Principal" : { "Service": [ "vpc-flow-logs.amazonaws.com" ] },
+              "Action" : "sts:AssumeRole"
+            } 
+          ]
+        },
+        "Path" : "/",
+        "Policies" : [ 
+          {
+            "PolicyName" : "flowlogs",
+            "PolicyDocument" : {
+              "Statement" : [
+                {
+                  "Effect" : "Allow",
+                  "Action" : [
+                    "logs:CreateLogGroup",
+                    "logs:CreateLogStream",
+                    "logs:PutLogEvents",
+                    "logs:DescribeLogGroups",
+                    "logs:DescribeLogStreams"
+                  ],
+                  "Resource" : "*" 
+                }
+              ]
+            }
+          } 
+        ]
+      }
+    },
+
+    "CloudWatchToKinesis" : {
+      "Type": "AWS::IAM::Role",
+      "Properties" : {
+        "AssumeRolePolicyDocument" : {
+          "Statement": [
+            {
+              "Effect" : "Allow",
+              "Principal" : { 
+                "Service" : { "Fn::Join" : [ "", 
+                  ["logs.", { "Ref": "AWS::Region"} ,".amazonaws.com" ] ] }
+              },
+              "Action" : "sts:AssumeRole"
+            }
+          ]
+        }
+      }
+    },
+
+    "CloudWatchToKinesisPolicy" : {
+      "Type": "AWS::IAM::Policy",
+      "Properties": {
+        "PolicyName" : "kinesis",
+        "Roles": [ { "Ref": "CloudWatchToKinesis" } ], 
+        "PolicyDocument" : {
+          "Statement": [
+            {
+              "Effect" : "Allow",
+              "Action" : [
+                "kinesis:PutRecord"
+              ],
+              "Resource" :  [ 
+                { "Fn::GetAtt" : [ "LogStream",  "Arn" ] }
+              ]
+            },
+            {
+              "Effect": "Allow",
+              "Action": "iam:PassRole",
+              "Resource": [
+                { "Fn::GetAtt" : [ "CloudWatchToKinesis", "Arn" ] }
+              ]
+            }
+          ]
+        }
+      } 
+    },
+
+    "LambdaRole": {
+      "Type" : "AWS::IAM::Role",
+      "Properties" : {
+        "AssumeRolePolicyDocument" : {
+          "Statement" : [ 
+            {
+              "Effect" : "Allow",
+              "Principal" : { "Service": [ "lambda.amazonaws.com" ] },
+              "Action" : [ "sts:AssumeRole" ]
+            } 
+          ]
+        }
+      }
+    },
+
+    "LambdaPolicy": {
+      "Type": "AWS::IAM::Policy",
+      "Properties": {
+        "Roles": [ { "Ref": "LambdaRole" } ], 
+        "PolicyName" : "lambda",
+        "PolicyDocument" : {
+          "Statement": [
+            {
+              "Effect": "Allow",
+              "Action": [
+                "lambda:InvokeFunction"
+              ],
+              "Resource": [
+                "*"
+              ]
+            },
+            {
+              "Effect": "Allow",
+              "Action": [
+                "s3:PutObject"
+              ],
+              "Resource": [ { "Fn::Join" : [ "", [
+                "arn:aws:s3:::", { "Ref" : "Bucket" }, 
+                  "/flowlogs/*" ] ] }
+              ]
+            },
+            {
+              "Effect": "Allow",
+              "Action": [
+                "logs:CreateLogGroup",
+                "logs:CreateLogStream",
+                "logs:PutLogEvents"
+              ],
+              "Resource": [ 
+                "*" 
+              ]
+            },
+            {
+              "Effect": "Allow",
+              "Action": [
+                "kinesis:GetRecords",
+                "kinesis:GetShardIterator",
+                "kinesis:DescribeStream",
+                "kinesis:ListStreams" 
+              ],
+              "Resource": [ 
+                { "Fn::GetAtt" : [ "LogStream", "Arn" ] }
+              ]
+            }
+          ]
+        }
+      } 
+    },
+
+    "FlowLogFilter" : {
+      "DependsOn" : [ "CloudWatchToKinesisPolicy", "FlowLogUpload" ],
+      "Type" : "AWS::Logs::SubscriptionFilter",
+      "Properties" : {
+        "DestinationArn" : { "Fn::GetAtt" : [ "LogStream",
+          "Arn" ] },
+        "FilterPattern" : { "Fn::Join" : ["", [ "[version, account_id, ",
+          "interface_id, srcaddr, dstaddr, srcport, dstport, protocol, ",  
+          "packets, bytes, start, end, action, log_status]" ] ] },
+        "LogGroupName" : { "Ref" : "FlowLogs" },
+        "RoleArn" : { "Fn::GetAtt" : [ "CloudWatchToKinesis", "Arn" ] }
+      }
+    },
+
+    "FlowLogUpload" : {
+      "DependsOn" : [ "LambdaPolicy" ],
+      "Type" : "AWS::Lambda::Function",
+      "Properties" : { 
+        "Handler" : "lambda_kinesis_flow_logs.lambda_handler",
+        "MemorySize" : 128,
+        "Role" : { "Fn::GetAtt" : [ "LambdaRole", "Arn" ] },
+        "Runtime" : "python2.7",
+        "Timeout" : 7,
+        "Code" : {
+          "S3Bucket": "dwolla-technical-exercise-repo",
+          "S3Key": "lambda_kinesis_flow_logs.py.zip"
+            }
+          }
+      },
+
+
+    "KinesisToLambda" : {
+      "Type" : "AWS::Lambda::EventSourceMapping",
+      "Properties" : {
+        "BatchSize" : { "Fn::FindInMap" : [ "Defaults", "EventSourceMapping",
+          "BatchSize" ] },
+        "Enabled" : "True",
+        "EventSourceArn" : { "Fn::GetAtt" : [ "LogStream", 
+          "Arn" ] },
+        "FunctionName" : { "Ref" : "FlowLogUpload" },
+        "StartingPosition" : "TRIM_HORIZON"
+      }
+    }
+  },
+  
+  "Outputs" : {
+    "LogGroupName" : {
+      "Value" : { "Ref" : "FlowLogs" }
+    },
+
+    "DeliverLogsPermissionArn" : {
+      "Value" : { "Fn::GetAtt" : [ "FlowLogsToCloudWatch", "Arn" ] }
+    },
+
+    "S3LogLocation" : {
+      "Value" : { "Ref" : "Bucket" }
+    },
+
+    "AddFlowLogToVpcCmd" : {
+      "Value" : { "Fn::Join" : [ "", [ 
+        "aws ec2 create-flow-logs --resource-type VPC",
+        " --traffic-type ALL --resource-ids vpc-c4143ea1",
+        " --log-group-name ", { "Ref" : "FlowLogs" }, 
+        " --deliver-logs-permission-arn ", 
+          { "Fn::GetAtt" : [ "FlowLogsToCloudWatch", "Arn" ] }
+        ] ] 
+      }
+    }
+  }
+}
